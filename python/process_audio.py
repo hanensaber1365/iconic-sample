@@ -46,15 +46,9 @@ from scipy.signal import butter, filtfilt, find_peaks , iirnotch , sosfiltfilt  
 # Converting mp3/mp4/m4a/aac/wma/etc. requires an ffmpeg binary somewhere.
 # We try, in order:
 #   1) imageio-ffmpeg's bundled binary  -> zero setup, just `pip install imageio-ffmpeg`
+#      (Laravel passes its path in IMAGEIO_FFMPEG_EXE, so this lookup is instant)
 #   2) a system ffmpeg already on PATH  -> if you installed ffmpeg yourself
-# Whichever is found gets wired into pydub automatically.
-try:
-    from pydub import AudioSegment
-    PYDUB_AVAILABLE = True
-except ImportError:
-    PYDUB_AVAILABLE = False
-    print("[warning] pydub not installed - will fall back to librosa/soundfile for conversion.\n"
-          "          (pip install pydub for full format support.)")
+# convert_to_wav() calls ffmpeg directly, so pydub is not imported (it only slowed start-up).
 
 FFMPEG_EXE = None   # will hold whichever ffmpeg binary we end up using
 
@@ -75,26 +69,9 @@ except ImportError:
             "          Then restart the kernel and re-run this cell."
         )
 
-# Point pydub at whichever ffmpeg binary we found (imageio-ffmpeg or system).
-if PYDUB_AVAILABLE and FFMPEG_EXE:
-    AudioSegment.converter = FFMPEG_EXE
-    AudioSegment.ffprobe   = FFMPEG_EXE   # ffmpeg binary can also serve as ffprobe for pydub's probing
-
 warnings.filterwarnings('ignore')         # hide librosa's PySoundFile deprecation notices
 
 print("Imports complete.")
-
-
-# %%
-import imageio_ffmpeg
-from pydub import AudioSegment
-
-# Force pydub to use the bundled ffmpeg binary
-_ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-AudioSegment.converter = _ffmpeg
-AudioSegment.ffprobe   = _ffmpeg
-
-print(f"[ok] ffmpeg wired: {_ffmpeg}")
 
 # %% [markdown]
 # ---
@@ -114,9 +91,6 @@ NOISE_PATH = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else None
 OUTPUT_DIR = sys.argv[3] if len(sys.argv) > 3 else "output"
 FFMPEG_PATH = None
 if FFMPEG_PATH is not None:
-    if PYDUB_AVAILABLE:
-        AudioSegment.converter = FFMPEG_PATH
-        AudioSegment.ffprobe   = FFMPEG_PATH
     FFMPEG_EXE = FFMPEG_PATH
     print(f"[ok] Overriding ffmpeg binary -> {FFMPEG_PATH}")
 
@@ -162,13 +136,62 @@ CONVERTED_WAV_PATH = os.path.join(OUTPUT_DIR, "converted.wav")
 SAVE_WAV_PATH = os.path.join(OUTPUT_DIR, "processed_audio.wav")
 FUNDAMENTAL_WAV_PATH = os.path.join(OUTPUT_DIR, "processed_audio_fundamental_only.wav") # fundamental-only audio
 
+# -- Plot mode -------------------------------------------------------------------
+# Drawing the 10 plots takes far longer than the signal processing itself, so the
+# web app does not wait for them:
+#   "inline"   (default) - process the audio and draw the plots in this run
+#   "deferred" - process the audio and save the WAVs, then start a background run
+#                in "only" mode and exit immediately (used by the Laravel app)
+#   "only"     - background run: draw the plots only; never rewrites the WAVs
+PLOTS_MODE = os.environ.get("AUDIO_PLOTS", "inline")
+DRAW_PLOTS = PLOTS_MODE in ("inline", "only")
+
 # -----------------------------------------------------------------------------
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+if PLOTS_MODE != "only":
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 #------------------------------------------------------------------------------
 def save_current_figure(filename):
+    if not DRAW_PLOTS:
+        plt.close()
+        return
+    if PLOTS_MODE == "only" and not os.path.isfile(SAVE_WAV_PATH):
+        # The sample was deleted while its plots were still being drawn.
+        plt.close()
+        sys.exit(0)
+    plt.tight_layout()
     path = os.path.join(OUTPUT_DIR, filename)
-    plt.savefig(path, dpi=150, bbox_inches="tight")
+    # Write under a temporary name first, so the results page never shows a half-written image.
+    tmp_path = path + ".part.png"
+    plt.savefig(tmp_path, dpi=150, bbox_inches="tight")
+    os.replace(tmp_path, path)
+    plt.close()
     print(f"[ok] Plot saved -> {path}")
+
+# A plot is only ~2000 px wide, so drawing millions of samples is wasted work
+# (it was the slowest part of the whole pipeline). Keep the min and max sample
+# of each bin: the picture looks the same, peaks included, but renders fast.
+PLOT_MAX_BINS = 4000
+
+def plot_points(x, y, max_bins=PLOT_MAX_BINS):
+    x, y = np.asarray(x), np.asarray(y)
+    n = len(y)
+    if n <= 2 * max_bins:
+        return x, y
+    step = n // max_bins
+    m = step * max_bins
+    blocks = y[:m].reshape(max_bins, step)
+    i_min, i_max = blocks.argmin(axis=1), blocks.argmax(axis=1)
+    starts = np.arange(max_bins) * step
+    idx = np.empty(2 * max_bins, dtype=int)
+    idx[0::2] = starts + np.minimum(i_min, i_max)   # keep left-to-right order
+    idx[1::2] = starts + np.maximum(i_min, i_max)
+    idx = np.concatenate([idx, np.arange(m, n)])    # leftover tail samples
+    return x[idx], y[idx]
+
+def spectrum_points(freqs, mags, f_limit):
+    """Only the part of the spectrum that is visible (x-axis is cut at f_limit)."""
+    visible = freqs <= f_limit
+    return plot_points(freqs[visible], mags[visible])
 #------------------------------------------------------------------------------
 if AUDIO_PATH is None:
     raise ValueError("No audio file was provided.")
@@ -299,7 +322,10 @@ def convert_to_wav(input_path, output_path):
         ) from exc
 
 
-WAV_PATH = convert_to_wav(AUDIO_PATH, CONVERTED_WAV_PATH)
+if PLOTS_MODE == "only" and os.path.isfile(CONVERTED_WAV_PATH):
+    WAV_PATH = CONVERTED_WAV_PATH   # the first run already converted it; don't rewrite the file
+else:
+    WAV_PATH = convert_to_wav(AUDIO_PATH, CONVERTED_WAV_PATH)
 
 #-------------------------------------------------------------------------
 
@@ -412,14 +438,12 @@ assert 0 < PEAK_FREQ_LIMIT < NYQUIST, (
 time = np.linspace(0, len(y) / sr, num=len(y))
 
 plt.figure(figsize=(12, 4))
-plt.plot(time, y, lw=1, color='#CF0F47')
+plt.plot(*plot_points(time, y), lw=1, color='#CF0F47')
 plt.title(f'Raw Audio Signal: {filename}', fontsize=14)
 plt.xlabel('Time (seconds)', fontsize=12)
 plt.ylabel('Amplitude', fontsize=12)
 plt.grid(True, linestyle='--', alpha=0.5)
-plt.tight_layout()
 save_current_figure("raw_signal.png")
-plt.close()
 
 
 # %% [markdown]
@@ -445,7 +469,7 @@ y_trimmed, trim_index = librosa.effects.trim(y, top_db=20)
 time_trimmed = np.linspace(0, len(y_trimmed) / sr, num=len(y_trimmed))
 
 plt.figure(figsize=(12, 4))
-plt.plot(time_trimmed, y_trimmed, lw=1, color='#A5158C')
+plt.plot(*plot_points(time_trimmed, y_trimmed), lw=1, color='#A5158C')
 plt.title(
     f'Trimmed Audio Waveform (Duration: {len(y)/sr:.2f}s -> {len(y_trimmed)/sr:.2f}s)',
     fontsize=14
@@ -453,9 +477,7 @@ plt.title(
 plt.xlabel('Time (seconds)', fontsize=12)
 plt.ylabel('Amplitude', fontsize=12)
 plt.grid(True, linestyle='--', alpha=0.5)
-plt.tight_layout()
 save_current_figure("trimmed_signal.png")
-plt.close()
 
 
 
@@ -501,14 +523,12 @@ y_filtered = bandpass_filter(y_trimmed, sr, lowcut=LOWCUT, highcut=HIGHCUT)
 time_filtered = np.linspace(0, len(y_filtered) / sr, num=len(y_filtered))
 
 plt.figure(figsize=(12, 4))
-plt.plot(time_filtered, y_filtered, lw=1, color='#0B6E4F')
+plt.plot(*plot_points(time_filtered, y_filtered), lw=1, color='#0B6E4F')
 plt.title(f'Band-Pass Filtered Waveform ({LOWCUT}-{HIGHCUT} Hz)', fontsize=14)
 plt.xlabel('Time (seconds)', fontsize=12)
 plt.ylabel('Amplitude', fontsize=12)
 plt.grid(True, linestyle='--', alpha=0.5)
-plt.tight_layout()
 save_current_figure("bandpass_signal.png")
-plt.close()
 
 
 # %% [markdown]
@@ -582,9 +602,7 @@ ax.set_ylabel('Frequency (Hz)', fontsize=12)
 cbar = fig.colorbar(img, ax=ax, format='%+0.1f dB')
 cbar.set_label('Intensity (dB)', fontsize=11)
 ax.grid(alpha=0.2, linestyle='--')
-plt.tight_layout()
 save_current_figure("stft_spectrogram.png")
-plt.close()
 
 
 # %% [markdown]
@@ -611,23 +629,22 @@ angular_frequency = 2 * np.pi * frequencies_final                      # omega =
 fig, axes = plt.subplots(2, 1, figsize=(12, 8))
 
 # -- Panel 1: Magnitude vs. Time ---------------------------------------------
-axes[0].plot(t_final, normalized_audio, lw=0.8, color='#CF0F47')
+axes[0].plot(*plot_points(t_final, normalized_audio), lw=0.8, color='#CF0F47')
 axes[0].set_title(f'Magnitude vs. Time (Processed Signal): {filename}', fontsize=13)
 axes[0].set_xlabel('Time (s)', fontsize=11)
 axes[0].set_ylabel('Amplitude', fontsize=11)
 axes[0].grid(True, linestyle='--', alpha=0.5)
 
 # -- Panel 2: Magnitude vs. Angular Frequency --------------------------------
-axes[1].plot(angular_frequency, magnitude_final, lw=0.8, color='#1f3b73')
+axes[1].plot(*spectrum_points(angular_frequency, magnitude_final, 2 * np.pi * PEAK_FREQ_LIMIT),
+             lw=0.8, color='#1f3b73')
 axes[1].set_title('Magnitude vs. Angular Frequency (Processed Signal)', fontsize=13)
 axes[1].set_xlabel('Angular Frequency omega (rad/s)', fontsize=11)
 axes[1].set_ylabel('Normalized Magnitude', fontsize=11)
 axes[1].set_xlim(0, 2 * np.pi * PEAK_FREQ_LIMIT)
 axes[1].grid(True, linestyle='--', alpha=0.5)
 
-plt.tight_layout()
 save_current_figure("magnitude_analysis.png")
-plt.close()
 
 
 # %% [markdown]
@@ -641,7 +658,7 @@ fft_freqs = np.fft.rfftfreq(n, d=1/sr)
 magnitude = np.abs(fft_vals) / n * 2      # undo FFT scaling, recover full-amplitude estimate
 
 plt.figure(figsize=(14, 6))
-plt.plot(fft_freqs, magnitude, lw=1, color='#1f3b73')
+plt.plot(*spectrum_points(fft_freqs, magnitude, PEAK_FREQ_LIMIT), lw=1, color='#1f3b73')
 plt.title('Frequency Spectrum (FFT - Full Signal)', fontsize=15)
 plt.xlabel('Frequency (Hz)', fontsize=12)
 plt.ylabel('Amplitude', fontsize=12)
@@ -665,9 +682,7 @@ for p in all_peaks:
                  textcoords='offset points', ha='center', fontsize=9,
                  bbox=dict(boxstyle='round,pad=0.3', fc='yellow', alpha=0.7))
 
-plt.tight_layout()
 save_current_figure("fft_spectrum.png")
-plt.close()
 
 print(f"\nTotal peaks detected: {len(all_peaks)}")
 print(f"{'Rank':<6} {'Frequency (Hz)':<18} {'Amplitude'}")
@@ -791,7 +806,7 @@ for f, m, reason in rejected:
 
 # -- Visualize accepted vs rejected peaks on the spectrum --------------------
 plt.figure(figsize=(14, 6))
-plt.plot(fft_freqs, magnitude, lw=1, color='#1f3b73', alpha=0.8)
+plt.plot(*spectrum_points(fft_freqs, magnitude, PEAK_FREQ_LIMIT), lw=1, color='#1f3b73', alpha=0.8)
 plt.axvspan(FREQ_MIN, FREQ_MAX, color='green', alpha=0.07, label=f'Valid range [{FREQ_MIN}, {FREQ_MAX}] Hz')
 
 for f, m in accepted:
@@ -810,9 +825,7 @@ plt.ylabel('Amplitude', fontsize=12)
 plt.xlim(0, PEAK_FREQ_LIMIT)
 plt.legend()
 plt.grid(alpha=0.3, linestyle='--')
-plt.tight_layout()
 save_current_figure("harmonic_peaks.png")
-plt.close()
 
 # %% [markdown]
 # ---
@@ -909,21 +922,21 @@ else:
 def amp_spectrum(x):
     return np.abs(np.fft.rfft(x)) / len(x) * 2
 
-spec_before = amp_spectrum(normalized_audio)
+spec_before = magnitude                    # same as amp_spectrum(normalized_audio), already computed in 5.3
 spec_after  = amp_spectrum(y_no_harm)
 
 plt.figure(figsize=(14, 6))
-plt.plot(fft_freqs, spec_before, lw=1, color='#1f3b73', alpha=0.6, label='Before harmonic removal')
-plt.plot(fft_freqs, spec_after,  lw=1, color='#CF0F47', label='After harmonic removal')
+plt.plot(*spectrum_points(fft_freqs, spec_before, PEAK_FREQ_LIMIT), lw=1, color='#1f3b73', alpha=0.6,
+         label='Before harmonic removal')
+plt.plot(*spectrum_points(fft_freqs, spec_after, PEAK_FREQ_LIMIT), lw=1, color='#CF0F47',
+         label='After harmonic removal')
 plt.axvline(f0, color='green', ls='-', lw=1.5, label=f'Fundamental {f0:.0f} Hz')
 for k, (n, fh, _) in enumerate(harmonics):
     plt.axvline(fh, color='red', ls='--', lw=1, label='Removed harmonics' if k == 0 else None)
 plt.title('Step 6.1 - Harmonics of the Fundamental Removed', fontsize=14)
 plt.xlabel('Frequency (Hz)', fontsize=12); plt.ylabel('Amplitude', fontsize=12)
 plt.xlim(0, PEAK_FREQ_LIMIT); plt.grid(alpha=0.3, linestyle='--'); plt.legend()
-plt.tight_layout()
 save_current_figure("harmonic_removal.png")
-plt.close()
 
 
 # %% [markdown]
@@ -972,27 +985,26 @@ print(f"Out-of-band / in-band energy :  before = {out_of_band_ratio(normalized_a
 fig, ax = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
 for a, x, title, col in zip(
         ax,
-        [normalized_audio, y_no_harm, y_fund_norm],
+        [spec_before, spec_after, amp_spectrum(y_fund_norm)],   # reuse spectra computed above
         ['Original (after pre-processing)', 'After harmonic removal', 'After fundamental-only filter'],
         ['#1f3b73', '#CF0F47', '#0B6E4F']):
-    a.plot(fft_freqs, amp_spectrum(x), lw=1, color=col)
+    a.plot(*spectrum_points(fft_freqs, x, PEAK_FREQ_LIMIT), lw=1, color=col)
     a.axvspan(band_lo, band_hi, color='green', alpha=0.1)
     a.set_title(title, fontsize=12); a.set_ylabel('Amplitude'); a.grid(alpha=0.3, linestyle='--')
 ax[-1].set_xlabel('Frequency (Hz)'); ax[-1].set_xlim(0, PEAK_FREQ_LIMIT)
-plt.tight_layout()
 save_current_figure("fundamental_comparison.png")
-plt.close()
 
 # -- time-domain comparison -------------------------------------------------
 t_f = np.arange(len(y_fund_norm)) / sr
 plt.figure(figsize=(12, 4))
-plt.plot(t_f, normalized_audio, lw=0.8, color='#1f3b73', alpha=0.5, label='Before')
-plt.plot(t_f, y_fund_norm,      lw=1.0, color='#0B6E4F',           label=f'Fundamental only ({f0:.0f} Hz)')
+plt.plot(*plot_points(t_f, normalized_audio), lw=0.8, color='#1f3b73', alpha=0.5, label='Before')
+plt.plot(*plot_points(t_f, y_fund_norm),      lw=1.0, color='#0B6E4F', label=f'Fundamental only ({f0:.0f} Hz)')
 plt.title('Waveform: Original vs. Fundamental-Only', fontsize=13)
 plt.xlabel('Time (s)'); plt.ylabel('Amplitude'); plt.grid(alpha=0.5, linestyle='--'); plt.legend()
-plt.tight_layout()
 save_current_figure("waveform_comparison.png")
-plt.close()
+
+if PLOTS_MODE == "only":
+    sys.exit(0)   # background plot run: the WAVs were already written by the first run
 
 sf.write(FUNDAMENTAL_WAV_PATH, y_fund_norm, sr)
 print(f"[ok] Fundamental-only audio saved -> {FUNDAMENTAL_WAV_PATH}")
@@ -1006,6 +1018,56 @@ print(f"[ok] Fundamental-only audio saved -> {FUNDAMENTAL_WAV_PATH}")
 # soundfile writes a lossless WAV file - the cleaned, filtered, normalised signal.
 sf.write(SAVE_WAV_PATH, normalized_audio, sr)
 print(f"[ok] Processed audio saved -> {SAVE_WAV_PATH}")
+
+
+# %% [markdown]
+# ---
+# ## 8 — Draw the Plots in the Background (deferred mode only)
+
+# %%
+def start_background_plots():
+    """
+    Re-run this script in "only" mode as a fully detached process and return
+    at once. Its output is not connected to ours, so the caller (Laravel)
+    gets the results without waiting for the plots.
+    """
+    import subprocess
+
+    env = dict(os.environ, AUDIO_PLOTS="only")
+    log_path = os.environ.get("AUDIO_PLOTS_LOG") or os.devnull
+
+    options = {}
+    if os.name == "nt":
+        options["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        options["start_new_session"] = True
+
+    try:
+        log = open(log_path, "a", encoding="utf-8")
+    except OSError:
+        log = open(os.devnull, "w")
+
+    # The audio results are already saved: a failure here must not fail the run.
+    try:
+        with log:
+            subprocess.Popen(
+                [sys.executable, os.path.abspath(__file__), AUDIO_PATH, NOISE_PATH or "", OUTPUT_DIR],
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                close_fds=True,
+                **options,
+            )
+    except OSError as exc:
+        print(f"[warning] Could not start background plotting: {exc}")
+        return
+
+    print("[info] Plots are being drawn in the background.")
+
+
+if PLOTS_MODE == "deferred":
+    start_background_plots()
 
 
 

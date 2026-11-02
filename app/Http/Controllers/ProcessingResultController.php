@@ -17,6 +17,17 @@ class ProcessingResultController extends Controller
     }
 
     /**
+     * Which plots of one result are ready; polled by the results page while
+     * the background Python run is still drawing them.
+     */
+    public function plots(ProcessingResult $result)
+    {
+        return response()->json([
+            'ready' => $result->readyPlots(),
+        ]);
+    }
+
+    /**
      * Export all samples and their measurements as an Excel (.xlsx) file.
      */
     public function export()

@@ -207,6 +207,23 @@
         transform: scale(1.02);
     }
 
+    .al-plot-pending {
+        display: grid;
+        place-items: center;
+        aspect-ratio: 16 / 7;
+        color: var(--muted);
+        font-size: 13px;
+        animation: al-pulse 1.4s ease-in-out infinite;
+    }
+
+    .al-plot-pending.failed {
+        animation: none;
+    }
+
+    @keyframes al-pulse {
+        50% { opacity: .45; }
+    }
+
     .al-plot-download {
         display: block;
         padding: 10px 16px;
@@ -308,6 +325,23 @@
         transform: scale(1.05);
     }
 
+    .al-flash {
+        margin-bottom: 22px;
+        padding: 14px 18px;
+        border-radius: 14px;
+        border: 1px solid var(--line);
+        background: var(--teal-soft);
+        color: var(--teal);
+        font-size: 14px;
+        font-weight: 600;
+    }
+
+    .al-flash.error {
+        border-color: rgba(255, 80, 80, .35);
+        background: rgba(255, 80, 80, .08);
+        color: #ff7777;
+    }
+
     @media (max-width: 900px) {
 
         .al-audio-grid,
@@ -361,26 +395,25 @@
 
 </div>
 
+@if (session('success'))
+    <div class="al-flash">{{ session('success') }}</div>
+@endif
+
+@if ($errors->any())
+    <div class="al-flash error">{{ $errors->first() }}</div>
+@endif
+
 @if ($results->count())
 
 @foreach ($results as $result)
 
     @php
 
-        $runDirectory = dirname($result->original_path);
+        $runDirectory = $result->runDirectory();
 
-        $plots = [
-            'Raw Signal' => 'raw_signal.png',
-            'Trimmed Signal' => 'trimmed_signal.png',
-            'Bandpass Signal' => 'bandpass_signal.png',
-            'STFT Spectrogram' => 'stft_spectrogram.png',
-            'Magnitude Analysis' => 'magnitude_analysis.png',
-            'FFT Spectrum' => 'fft_spectrum.png',
-            'Harmonic Peaks' => 'harmonic_peaks.png',
-            'Harmonic Removal' => 'harmonic_removal.png',
-            'Fundamental Comparison' => 'fundamental_comparison.png',
-            'Waveform Comparison' => 'waveform_comparison.png',
-        ];
+        $readyPlots = $result->readyPlots();
+
+        $plotsPending = count($readyPlots) < count(\App\Models\ProcessingResult::PLOTS);
 
     @endphp
 
@@ -420,7 +453,7 @@
             <form
                 action="{{ route('results.destroy', $result) }}"
                 method="POST"
-                onsubmit="return confirm('Are you sure you want to delete this processing result and all its files?');"
+                onsubmit="if (!confirm('Are you sure you want to delete this processing result and all its files?')) return false; this.querySelector('button').disabled = true; return true;"
             >
 
                 @csrf
@@ -504,9 +537,14 @@
             Signal processing plots
         </h3>
 
-        <div class="al-plots">
+        <div
+            class="al-plots"
+            @if ($plotsPending)
+                data-plots-status="{{ route('results.plots', $result) }}"
+            @endif
+        >
 
-            @foreach ($plots as $title => $filename)
+            @foreach (\App\Models\ProcessingResult::PLOTS as $title => $filename)
 
                 @php
 
@@ -514,28 +552,41 @@
 
                     $plotUrl = asset('storage/' . $plotPath);
 
+                    $plotReady = in_array($filename, $readyPlots, true);
+
                 @endphp
 
-                <div class="al-plot">
+                <div class="al-plot" data-plot-file="{{ $filename }}">
 
                     <div class="al-plot-title">
                         {{ $title }}
                     </div>
 
-                    <img
-                        src="{{ $plotUrl }}"
-                        alt="{{ $title }}"
-                        loading="lazy"
-                        onclick="openImageViewer('{{ $plotUrl }}')"
-                    >
+                    @if ($plotReady)
 
-                    <a
-                        class="al-plot-download"
-                        href="{{ $plotUrl }}"
-                        download
-                    >
-                        Download image
-                    </a>
+                        <img
+                            src="{{ $plotUrl }}"
+                            alt="{{ $title }}"
+                            loading="lazy"
+                            onclick="openImageViewer('{{ $plotUrl }}')"
+                        >
+
+                        <a
+                            class="al-plot-download"
+                            href="{{ $plotUrl }}"
+                            download
+                        >
+                            Download image
+                        </a>
+
+                    @else
+
+                        {{-- Still being drawn in the background; swapped in by the script below. --}}
+                        <div class="al-plot-pending" data-plot-url="{{ $plotUrl }}" data-plot-title="{{ $title }}">
+                            Generating plot…
+                        </div>
+
+                    @endif
 
                 </div>
 
@@ -658,6 +709,79 @@
         if (event.key === 'Escape') {
             closeImageViewer();
         }
+
+    });
+
+
+    // Plots are drawn in the background after processing. Ask the server which
+    // ones are ready and swap them in, until all are there or we give up.
+    function showReadyPlot(placeholder) {
+
+        const url = placeholder.dataset.plotUrl;
+
+        const image = document.createElement('img');
+        image.src = url + '?v=' + Date.now();
+        image.alt = placeholder.dataset.plotTitle;
+        image.onclick = () => openImageViewer(url);
+
+        const download = document.createElement('a');
+        download.className = 'al-plot-download';
+        download.href = url;
+        download.download = '';
+        download.textContent = 'Download image';
+
+        placeholder.replaceWith(image, download);
+
+    }
+
+
+    document.querySelectorAll('[data-plots-status]').forEach(function (grid) {
+
+        const statusUrl = grid.dataset.plotsStatus;
+        const startedAt = Date.now();
+        const giveUpAfterMs = 3 * 60 * 1000;
+
+        async function poll() {
+
+            try {
+                const response = await fetch(statusUrl, { headers: { 'Accept': 'application/json' } });
+
+                if (response.ok) {
+                    const { ready } = await response.json();
+
+                    ready.forEach(function (file) {
+                        const placeholder = grid.querySelector(
+                            '[data-plot-file="' + file + '"] .al-plot-pending'
+                        );
+
+                        if (placeholder) {
+                            showReadyPlot(placeholder);
+                        }
+                    });
+                }
+            } catch (error) {
+                // Network hiccup: just try again on the next tick.
+            }
+
+            const pending = grid.querySelectorAll('.al-plot-pending');
+
+            if (pending.length === 0) {
+                return;
+            }
+
+            if (Date.now() - startedAt > giveUpAfterMs) {
+                pending.forEach(function (placeholder) {
+                    placeholder.classList.add('failed');
+                    placeholder.textContent = 'Plot not available.';
+                });
+                return;
+            }
+
+            setTimeout(poll, 2000);
+
+        }
+
+        setTimeout(poll, 1500);
 
     });
 

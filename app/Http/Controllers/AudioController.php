@@ -4,6 +4,7 @@ namespace App\Http\Controllers;
 
 use App\Models\ProcessingResult;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
@@ -95,19 +96,7 @@ class AudioController extends Controller
 
         $audioPath = storage_path("app/public/{$originalRelativePath}");
 
-        // Locate the bundled ffmpeg executable using the same Python environment.
-        $ffmpegProcess = new Process([
-            $python,
-            '-c',
-            'import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())',
-        ]);
-
-        $ffmpegProcess->setTimeout(30);
-        $ffmpegProcess->run();
-
-        $ffmpegPath = $ffmpegProcess->isSuccessful()
-            ? trim($ffmpegProcess->getOutput())
-            : '';
+        $ffmpegPath = $this->ffmpegPath($python);
 
         $command = [
             $python,
@@ -203,6 +192,10 @@ class AudioController extends Controller
             'MPLBACKEND' => 'Agg',
             'MPLCONFIGDIR' => $cacheDir,
             'NUMBA_CACHE_DIR' => $cacheDir,
+            // Return as soon as the audio is processed; the plots are drawn by a
+            // background Python run and appear on the results page when ready.
+            'AUDIO_PLOTS' => 'deferred',
+            'AUDIO_PLOTS_LOG' => storage_path('logs/plots.log'),
         ];
 
         if (PHP_OS_FAMILY === 'Windows') {
@@ -333,6 +326,43 @@ class AudioController extends Controller
         return redirect()
             ->route('results')
             ->with('success', 'Audio processed successfully.');
+    }
+
+    /**
+     * Locate the bundled ffmpeg executable using the same Python environment.
+     *
+     * Starting Python just to ask for this path took seconds on every upload,
+     * so the answer is cached per interpreter and only looked up again if the
+     * cached file disappears (e.g. the virtual environment was recreated).
+     */
+    private function ffmpegPath(string $python): string
+    {
+        $cacheKey = 'audio.ffmpeg_path.' . md5($python);
+
+        $cached = Cache::get($cacheKey);
+
+        if (is_string($cached) && is_file($cached)) {
+            return $cached;
+        }
+
+        $ffmpegProcess = new Process([
+            $python,
+            '-c',
+            'import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())',
+        ]);
+
+        $ffmpegProcess->setTimeout(30);
+        $ffmpegProcess->run();
+
+        $ffmpegPath = $ffmpegProcess->isSuccessful()
+            ? trim($ffmpegProcess->getOutput())
+            : '';
+
+        if ($ffmpegPath !== '' && is_file($ffmpegPath)) {
+            Cache::forever($cacheKey, $ffmpegPath);
+        }
+
+        return $ffmpegPath;
     }
 
     /**
