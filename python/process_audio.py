@@ -154,12 +154,17 @@ def save_current_figure(filename):
     if not DRAW_PLOTS:
         plt.close()
         return
-    if PLOTS_MODE == "only" and not os.path.isfile(SAVE_WAV_PATH):
-        # The sample was deleted while its plots were still being drawn.
-        plt.close()
-        sys.exit(0)
-    plt.tight_layout()
     path = os.path.join(OUTPUT_DIR, filename)
+    if PLOTS_MODE == "only":
+        if not os.path.isfile(SAVE_WAV_PATH):
+            # The sample was deleted while its plots were still being drawn.
+            plt.close()
+            sys.exit(0)
+        if os.path.isfile(path):
+            # Restarted run: this plot was finished before the earlier run died.
+            plt.close()
+            return
+    plt.tight_layout()
     # Write under a temporary name first, so the results page never shows a half-written image.
     tmp_path = path + ".part.png"
     plt.savefig(tmp_path, dpi=150, bbox_inches="tight")
@@ -1025,49 +1030,18 @@ print(f"[ok] Processed audio saved -> {SAVE_WAV_PATH}")
 # ## 8 — Draw the Plots in the Background (deferred mode only)
 
 # %%
-def start_background_plots():
-    """
-    Re-run this script in "only" mode as a fully detached process and return
-    at once. Its output is not connected to ours, so the caller (Laravel)
-    gets the results without waiting for the plots.
-    """
-    import subprocess
-
-    env = dict(os.environ, AUDIO_PLOTS="only")
-    log_path = os.environ.get("AUDIO_PLOTS_LOG") or os.devnull
-
-    options = {}
-    if os.name == "nt":
-        options["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
-    else:
-        options["start_new_session"] = True
-
-    try:
-        log = open(log_path, "a", encoding="utf-8")
-    except OSError:
-        log = open(os.devnull, "w")
+# Re-run this script in "only" mode as a fully detached process (see start_plots.py).
+# Its output is not connected to ours, so the caller (Laravel) gets the results
+# without waiting for the plots.
+if PLOTS_MODE == "deferred":
+    from start_plots import start_background_plots
 
     # The audio results are already saved: a failure here must not fail the run.
     try:
-        with log:
-            subprocess.Popen(
-                [sys.executable, os.path.abspath(__file__), AUDIO_PATH, NOISE_PATH or "", OUTPUT_DIR],
-                env=env,
-                stdin=subprocess.DEVNULL,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                close_fds=True,
-                **options,
-            )
+        start_background_plots(AUDIO_PATH, NOISE_PATH, OUTPUT_DIR)
+        print("[info] Plots are being drawn in the background.")
     except OSError as exc:
         print(f"[warning] Could not start background plotting: {exc}")
-        return
-
-    print("[info] Plots are being drawn in the background.")
-
-
-if PLOTS_MODE == "deferred":
-    start_background_plots()
 
 
 

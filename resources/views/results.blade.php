@@ -739,7 +739,8 @@
 
         const statusUrl = grid.dataset.plotsStatus;
         const startedAt = Date.now();
-        const giveUpAfterMs = 3 * 60 * 1000;
+        // Long enough for the server to restart a background run that died.
+        const giveUpAfterMs = 5 * 60 * 1000;
 
         async function poll() {
 

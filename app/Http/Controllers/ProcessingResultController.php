@@ -3,6 +3,7 @@
 namespace App\Http\Controllers;
 
 use App\Models\ProcessingResult;
+use App\Services\AudioPipeline;
 use Illuminate\Support\Str;
 use OpenSpout\Common\Entity\Row;
 use OpenSpout\Writer\XLSX\Writer;
@@ -20,8 +21,13 @@ class ProcessingResultController extends Controller
      * Which plots of one result are ready; polled by the results page while
      * the background Python run is still drawing them.
      */
-    public function plots(ProcessingResult $result)
+    public function plots(ProcessingResult $result, AudioPipeline $pipeline)
     {
+        // If the background run died (e.g. killed when memory ran out), start it again.
+        if (count($result->readyPlots()) < count(ProcessingResult::PLOTS)) {
+            $pipeline->restartStalledPlots($result);
+        }
+
         return response()->json([
             'ready' => $result->readyPlots(),
         ]);

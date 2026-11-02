@@ -3,8 +3,8 @@
 namespace App\Http\Controllers;
 
 use App\Models\ProcessingResult;
+use App\Services\AudioPipeline;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
@@ -24,7 +24,7 @@ class AudioController extends Controller
         ]);
     }
 
-    public function process(Request $request)
+    public function process(Request $request, AudioPipeline $pipeline)
     {
         // 51200 KB = 50 MB per file.
         $request->validate([
@@ -61,8 +61,8 @@ class AudioController extends Controller
 
         // Python interpreter and processing script come from config/audio.php
         // (AUDIO_PYTHON in .env), so nothing here is tied to one machine.
-        $python = config('audio.python');
-        $script = config('audio.script');
+        $python = $pipeline->python();
+        $script = $pipeline->script();
 
         if (!is_file($python) || !is_file($script)) {
             return back()->withErrors([
@@ -96,7 +96,7 @@ class AudioController extends Controller
 
         $audioPath = storage_path("app/public/{$originalRelativePath}");
 
-        $ffmpegPath = $this->ffmpegPath($python);
+        $ffmpegPath = $pipeline->ffmpegPath();
 
         $command = [
             $python,
@@ -169,53 +169,11 @@ class AudioController extends Controller
 
         $process = new Process($command, base_path());
 
-        // Writable folder for matplotlib / numba caches, independent of the user account.
-        $cacheDir = storage_path('app/python-cache');
+        $env = $pipeline->environment($ffmpegPath);
 
-        if (!is_dir($cacheDir)) {
-            mkdir($cacheDir, 0775, true);
-        }
-
-        // Take these from the current machine instead of hardcoding a user profile.
-        $home = getenv('USERPROFILE') ?: (getenv('HOME') ?: $cacheDir);
-        $temp = getenv('TEMP') ?: (getenv('TMP') ?: $cacheDir);
-        $path = getenv('PATH') ?: '';
-
-        $env = [
-            'PYTHONHASHSEED' => '0',
-            'PYTHONHOME' => '',
-            'PYTHONPATH' => '',
-            'USERPROFILE' => $home,
-            'HOME' => $home,
-            'TEMP' => $temp,
-            'TMP' => $temp,
-            'MPLBACKEND' => 'Agg',
-            'MPLCONFIGDIR' => $cacheDir,
-            'NUMBA_CACHE_DIR' => $cacheDir,
-            // Return as soon as the audio is processed; the plots are drawn by a
-            // background Python run and appear on the results page when ready.
-            'AUDIO_PLOTS' => 'deferred',
-            'AUDIO_PLOTS_LOG' => storage_path('logs/plots.log'),
-        ];
-
-        if (PHP_OS_FAMILY === 'Windows') {
-            $windowsDir = getenv('SYSTEMROOT') ?: 'C:\\Windows';
-
-            $env['SYSTEMROOT'] = $windowsDir;
-            $env['WINDIR'] = $windowsDir;
-
-            if ($path === '') {
-                $path = $windowsDir . '\\System32;' . $windowsDir;
-            }
-        }
-
-        if ($ffmpegPath !== '' && is_file($ffmpegPath)) {
-            $env['IMAGEIO_FFMPEG_EXE'] = $ffmpegPath;
-
-            $path = dirname($ffmpegPath) . PATH_SEPARATOR . $path;
-        }
-
-        $env['PATH'] = $path;
+        // Return as soon as the audio is processed; the plots are drawn by a
+        // background Python run and appear on the results page when ready.
+        $env['AUDIO_PLOTS'] = 'deferred';
 
         $process->setEnv($env);
         $process->setTimeout(config('audio.timeout'));
@@ -326,43 +284,6 @@ class AudioController extends Controller
         return redirect()
             ->route('results')
             ->with('success', 'Audio processed successfully.');
-    }
-
-    /**
-     * Locate the bundled ffmpeg executable using the same Python environment.
-     *
-     * Starting Python just to ask for this path took seconds on every upload,
-     * so the answer is cached per interpreter and only looked up again if the
-     * cached file disappears (e.g. the virtual environment was recreated).
-     */
-    private function ffmpegPath(string $python): string
-    {
-        $cacheKey = 'audio.ffmpeg_path.' . md5($python);
-
-        $cached = Cache::get($cacheKey);
-
-        if (is_string($cached) && is_file($cached)) {
-            return $cached;
-        }
-
-        $ffmpegProcess = new Process([
-            $python,
-            '-c',
-            'import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())',
-        ]);
-
-        $ffmpegProcess->setTimeout(30);
-        $ffmpegProcess->run();
-
-        $ffmpegPath = $ffmpegProcess->isSuccessful()
-            ? trim($ffmpegProcess->getOutput())
-            : '';
-
-        if ($ffmpegPath !== '' && is_file($ffmpegPath)) {
-            Cache::forever($cacheKey, $ffmpegPath);
-        }
-
-        return $ffmpegPath;
     }
 
     /**
